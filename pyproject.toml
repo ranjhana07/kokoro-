@@ -25,11 +25,13 @@ classifiers = [
 dependencies = [
     "beautifulsoup4>=4.12.3",
     "ebooklib>=0.18",
-    "kokoro-onnx==0.3.9",
+    "kokoro-onnx>=0.4.4,<0.5",
     "pymupdf>=1.25.4",
     "pymupdf4llm>=0.0.17",
     "sounddevice>=0.5.1",
     "soundfile>=0.13.0",
+    "flask>=2.2",
+    "defusedxml>=0.7.1",
 ]
 
 [project.scripts]

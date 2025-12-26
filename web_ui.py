@@ -13,8 +13,19 @@ from flask import Flask, render_template, request, jsonify, send_file, Response,
 from kokoro_onnx import Kokoro
 import soundfile as sf
 import numpy as np
+from kokoro_tts.ssml_parser import parse_ssml
 
 app = Flask(__name__)
+@app.route('/favicon.ico')
+def favicon():
+    # Serve SVG favicon or return 204 to avoid 404 noise
+    svg_path = os.path.join(os.path.dirname(__file__), 'static', 'favicon.svg')
+    if os.path.exists(svg_path):
+        try:
+            return send_file(svg_path, mimetype='image/svg+xml')
+        except Exception:
+            pass
+    return Response(status=204)
 
 # Performance tuning: set thread env vars before heavy libs fully initialize
 os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 4))
@@ -176,40 +187,135 @@ def synthesize_stream():
             return jsonify({'error': f'Text too long. Maximum {MAX_TEXT_LENGTH} characters.'}), 400
 
         # Smaller chunks for lower per-chunk latency
-        max_chars = int((request.json or {}).get('stream_chunk_chars', 140))
-        chunks = split_for_streaming(text, max_chars=max_chars)
+        max_chars = int((request.json or {}).get('stream_chunk_chars', 100))
+
+        # SSML detection
+        is_ssml = '<speak' in text.lower()
 
         def generate():
-            # Light pipelining: keep one chunk prefetched
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                it = iter(chunks)
-                fut = None
+            if not is_ssml:
+                # Plain text streaming path (original behavior)
+                # Normalize decimals to speak 'point' via SSML parser, even for plain text
                 try:
-                    first = next(it)
-                except StopIteration:
-                    return
-                fut = pool.submit(model.create, first, voice=voice, lang=language, speed=speed)
-                for nxt in it:
-                    # wait current
+                    acts = parse_ssml(text, default_voice=voice, default_lang=language, default_speed=speed)
+                    norm_text = " ".join(a.get('text', '') for a in acts if a.get('type') == 'speak').strip()
+                    text_to_stream = norm_text or text
+                except Exception:
+                    text_to_stream = text
+                try:
+                    app.logger.info(f"[stream] normalize decimals: orig='{text}' -> norm='{text_to_stream}'")
+                except Exception:
+                    pass
+                chunks = split_for_streaming(text_to_stream, max_chars=max_chars)
+                # Prefetch multiple chunks to ensure next chunk is ready before current finishes
+                max_workers = CHUNK_MAX_WORKERS
+                prefetch = CHUNK_PREFETCH
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = []
+                    for idx in range(min(prefetch, len(chunks))):
+                        futures.append(pool.submit(
+                            model.create,
+                            chunks[idx],
+                            voice=voice,
+                            lang=language,
+                            speed=speed
+                        ))
+                    next_idx = len(futures)
+                    processed = 0
+                    while processed < len(chunks):
+                        fut = futures.pop(0)
+                        try:
+                            samples, sample_rate = fut.result()
+                        except Exception:
+                            samples, sample_rate = np.zeros((0,), dtype=np.float32), 0
+                        # Submit next chunk to keep pipeline full
+                        if next_idx < len(chunks):
+                            futures.append(pool.submit(
+                                model.create,
+                                chunks[next_idx],
+                                voice=voice,
+                                lang=language,
+                                speed=speed
+                            ))
+                            next_idx += 1
+                        processed += 1
+                        # Yield current as PCM frame
+                        pcm = np.asarray(samples, dtype=np.float32).tobytes()
+                        header = b'KOPC' + int(sample_rate).to_bytes(4, 'big') + len(pcm).to_bytes(4, 'big')
+                        yield header + pcm
+                return
+
+            # SSML streaming path: parse actions and stream each segment; emit silence for <break>
+            actions = parse_ssml(text, default_voice=voice, default_lang=language, default_speed=speed)
+            sample_rate_probe = None
+
+            def ensure_sr(v, l, s):
+                nonlocal sample_rate_probe
+                if sample_rate_probe is None:
                     try:
-                        samples, sample_rate = fut.result()
+                        _, sr = model.create("Hello.", voice=v or voice, lang=l or language, speed=s or speed)
+                        sample_rate_probe = sr
                     except Exception:
-                        samples, sample_rate = np.zeros((0,), dtype=np.float32), 0
-                    # submit next
-                    fut = pool.submit(model.create, nxt, voice=voice, lang=language, speed=speed)
-                    # yield current as PCM frame
-                    pcm = np.asarray(samples, dtype=np.float32).tobytes()
-                    header = b'KOPC' + int(sample_rate).to_bytes(4, 'big') + len(pcm).to_bytes(4, 'big')
-                    yield header + pcm
-                # last outstanding
-                if fut is not None:
+                        sample_rate_probe = 24000
+
+            for act in actions:
+                if act.get('type') == 'speak':
+                    seg_text = act.get('text', '')
+                    ctx_voice = act.get('voice') or voice
+                    ctx_lang = act.get('lang') or language
                     try:
-                        samples, sample_rate = fut.result()
+                        ctx_speed = float(act.get('speed') or speed)
                     except Exception:
-                        samples, sample_rate = np.zeros((0,), dtype=np.float32), 0
-                    pcm = np.asarray(samples, dtype=np.float32).tobytes()
-                    header = b'KOPC' + int(sample_rate).to_bytes(4, 'big') + len(pcm).to_bytes(4, 'big')
-                    yield header + pcm
+                        ctx_speed = speed
+                    ctx_volume = float(act.get('volume')) if act.get('volume') is not None else 1.0
+                    # Stream this segment in small chunks
+                    seg_chunks = split_for_streaming(seg_text, max_chars=max_chars)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=CHUNK_MAX_WORKERS) as pool:
+                        futures = []
+                        for idx in range(min(CHUNK_PREFETCH, len(seg_chunks))):
+                            futures.append(pool.submit(
+                                model.create,
+                                seg_chunks[idx],
+                                voice=ctx_voice,
+                                lang=ctx_lang,
+                                speed=ctx_speed
+                            ))
+                        next_idx = len(futures)
+                        processed = 0
+                        while processed < len(seg_chunks):
+                            fut = futures.pop(0)
+                            try:
+                                samples_seg, sr = fut.result()
+                            except Exception:
+                                samples_seg, sr = np.zeros((0,), dtype=np.float32), sample_rate_probe or 0
+                            if sample_rate_probe is None:
+                                sample_rate_probe = sr
+                            # Keep pipeline full
+                            if next_idx < len(seg_chunks):
+                                futures.append(pool.submit(
+                                    model.create,
+                                    seg_chunks[next_idx],
+                                    voice=ctx_voice,
+                                    lang=ctx_lang,
+                                    speed=ctx_speed
+                                ))
+                                next_idx += 1
+                            seg = np.asarray(samples_seg, dtype=np.float32)
+                            if ctx_volume != 1.0:
+                                seg = np.clip(seg * ctx_volume, -1.0, 1.0)
+                            pcm = seg.tobytes()
+                            header = b'KOPC' + int(sample_rate_probe or sr).to_bytes(4, 'big') + len(pcm).to_bytes(4, 'big')
+                            yield header + pcm
+                            processed += 1
+                elif act.get('type') == 'break':
+                    ms = int(act.get('time_ms', 0))
+                    if ms > 0:
+                        ensure_sr(act.get('voice'), act.get('lang'), act.get('speed'))
+                        silence_len = int((ms / 1000.0) * (sample_rate_probe or 24000))
+                        if silence_len > 0:
+                            pcm = (np.zeros((silence_len,), dtype=np.float32)).tobytes()
+                            header = b'KOPC' + int(sample_rate_probe or 24000).to_bytes(4, 'big') + len(pcm).to_bytes(4, 'big')
+                            yield header + pcm
 
         return Response(stream_with_context(generate()), mimetype='application/octet-stream', headers={'X-Content-Type-Options': 'nosniff'})
     except Exception as e:
@@ -264,6 +370,14 @@ def synthesize():
         if len(text) > MAX_TEXT_LENGTH:
             return jsonify({'error': f'Text too long. Maximum {MAX_TEXT_LENGTH} characters.'}), 400
 
+        # Detect/route SSML
+        is_ssml = False
+        try:
+            # simple heuristic: presence of <speak ...>
+            is_ssml = '<speak' in text.lower()
+        except Exception:
+            is_ssml = False
+
         # Chunking controls
         raw_chunk_flag = data.get('chunking', data.get('chunk', True))
         use_chunking = (
@@ -274,56 +388,165 @@ def synthesize():
         )
         chunk_limit = int(data.get('chunk_chars', CHUNK_CHAR_LIMIT))
         overlap_ms = int(data.get('chunk_overlap_ms', CHUNK_OVERLAP_MS))
-
-        if use_chunking:
-            chunks = smart_chunk_text(text, max_chars=chunk_limit)
+        if is_ssml:
+            # Parse SSML into actions and synthesize respecting breaks and prosody rate
+            actions = parse_ssml(text, default_voice=voice, default_lang=language, default_speed=speed)
             audio_chunks = []
             sample_rate = None
-            max_workers = int(data.get('chunk_workers', CHUNK_MAX_WORKERS))
-            prefetch = int(data.get('chunk_prefetch', CHUNK_PREFETCH))
-            max_workers = max(1, min(8, max_workers))
-            prefetch = max(1, min(8, prefetch))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = []
-                for idx in range(min(prefetch, len(chunks))):
-                    futures.append(pool.submit(
-                        model.create,
-                        chunks[idx],
-                        voice=voice,
-                        lang=language,
-                        speed=speed
-                    ))
-                next_idx = len(futures)
-                processed = 0
-                while processed < len(chunks):
-                    fut = futures.pop(0)
+            has_breaks = any(a.get('type') == 'break' and a.get('time_ms', 0) > 0 for a in actions)
+
+            def ensure_sample_rate(ctx_voice, ctx_lang, ctx_speed):
+                nonlocal sample_rate
+                if sample_rate is None:
                     try:
-                        samples, sr = fut.result()
-                        if sample_rate is None:
-                            sample_rate = sr
-                        audio_chunks.append(samples.astype(np.float32))
-                    except Exception as ce:
-                        # skip failed chunk
-                        pass
-                    processed += 1
-                    if next_idx < len(chunks):
+                        _, sr = model.create("Hello.", voice=ctx_voice or voice, lang=ctx_lang or language, speed=ctx_speed or speed)
+                        sample_rate = sr
+                    except Exception:
+                        # fallback if probe fails; choose common SR
+                        sample_rate = 24000
+
+            for act in actions:
+                if act.get('type') == 'speak':
+                    seg_text = act.get('text', '')
+                    ctx_voice = act.get('voice') or voice
+                    ctx_lang = act.get('lang') or language
+                    ctx_speed = float(act.get('speed') or speed)
+                    ctx_volume = float(act.get('volume')) if act.get('volume') is not None else 1.0
+                    if use_chunking:
+                        chunks = smart_chunk_text(seg_text, max_chars=chunk_limit)
+                        max_workers = int(data.get('chunk_workers', CHUNK_MAX_WORKERS))
+                        prefetch = int(data.get('chunk_prefetch', CHUNK_PREFETCH))
+                        max_workers = max(1, min(8, max_workers))
+                        prefetch = max(1, min(8, prefetch))
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                            futures = []
+                            for idx in range(min(prefetch, len(chunks))):
+                                futures.append(pool.submit(
+                                    model.create,
+                                    chunks[idx],
+                                    voice=ctx_voice,
+                                    lang=ctx_lang,
+                                    speed=ctx_speed
+                                ))
+                            next_idx = len(futures)
+                            processed = 0
+                            while processed < len(chunks):
+                                fut = futures.pop(0)
+                                try:
+                                    samples_seg, sr = fut.result()
+                                    if sample_rate is None:
+                                        sample_rate = sr
+                                    seg = samples_seg.astype(np.float32)
+                                    if ctx_volume != 1.0:
+                                        seg = np.clip(seg * ctx_volume, -1.0, 1.0)
+                                    audio_chunks.append(seg)
+                                except Exception:
+                                    pass
+                                processed += 1
+                                if next_idx < len(chunks):
+                                    futures.append(pool.submit(
+                                        model.create,
+                                        chunks[next_idx],
+                                        voice=ctx_voice,
+                                        lang=ctx_lang,
+                                        speed=ctx_speed
+                                    ))
+                                    next_idx += 1
+                    else:
+                        try:
+                            samples_seg, sr = model.create(seg_text, voice=ctx_voice, lang=ctx_lang, speed=ctx_speed)
+                            if sample_rate is None:
+                                sample_rate = sr
+                            seg = samples_seg.astype(np.float32)
+                            if ctx_volume != 1.0:
+                                seg = np.clip(seg * ctx_volume, -1.0, 1.0)
+                            audio_chunks.append(seg)
+                        except Exception:
+                            pass
+                elif act.get('type') == 'break':
+                    ms = int(act.get('time_ms', 0))
+                    if ms > 0:
+                        ensure_sample_rate(act.get('voice'), act.get('lang'), act.get('speed'))
+                        silence_len = int((ms / 1000.0) * sample_rate)
+                        if silence_len > 0:
+                            audio_chunks.append(np.zeros((silence_len,), dtype=np.float32))
+
+            # Merge chunks; disable overlap if we have intentional pauses
+            effective_overlap = 0 if has_breaks else overlap_ms
+            merged = crossfade_concat(audio_chunks, sample_rate, effective_overlap)
+            samples = merged
+        else:
+            if use_chunking:
+                # Normalize decimals to speak 'point' via SSML parser, even for plain text
+                try:
+                    acts = parse_ssml(text, default_voice=voice, default_lang=language, default_speed=speed)
+                    norm_text = " ".join(a.get('text', '') for a in acts if a.get('type') == 'speak').strip()
+                    text_for_chunks = norm_text or text
+                except Exception:
+                    text_for_chunks = text
+                try:
+                    app.logger.info(f"[synthesize-chunk] normalize decimals: orig='{text}' -> norm='{text_for_chunks}'")
+                except Exception:
+                    pass
+                chunks = smart_chunk_text(text_for_chunks, max_chars=chunk_limit)
+                audio_chunks = []
+                sample_rate = None
+                max_workers = int(data.get('chunk_workers', CHUNK_MAX_WORKERS))
+                prefetch = int(data.get('chunk_prefetch', CHUNK_PREFETCH))
+                max_workers = max(1, min(8, max_workers))
+                prefetch = max(1, min(8, prefetch))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = []
+                    for idx in range(min(prefetch, len(chunks))):
                         futures.append(pool.submit(
                             model.create,
-                            chunks[next_idx],
+                            chunks[idx],
                             voice=voice,
                             lang=language,
                             speed=speed
                         ))
-                        next_idx += 1
-            merged = crossfade_concat(audio_chunks, sample_rate, overlap_ms)
-            samples = merged
-        else:
-            samples, sample_rate = model.create(
-                text,
-                voice=voice,
-                lang=language,
-                speed=speed
-            )
+                    next_idx = len(futures)
+                    processed = 0
+                    while processed < len(chunks):
+                        fut = futures.pop(0)
+                        try:
+                            samples, sr = fut.result()
+                            if sample_rate is None:
+                                sample_rate = sr
+                            audio_chunks.append(samples.astype(np.float32))
+                        except Exception as ce:
+                            # skip failed chunk
+                            pass
+                        processed += 1
+                        if next_idx < len(chunks):
+                            futures.append(pool.submit(
+                                model.create,
+                                chunks[next_idx],
+                                voice=voice,
+                                lang=language,
+                                speed=speed
+                            ))
+                            next_idx += 1
+                merged = crossfade_concat(audio_chunks, sample_rate, overlap_ms)
+                samples = merged
+            else:
+                # Normalize decimals for direct (non-chunking) synthesis
+                try:
+                    acts = parse_ssml(text, default_voice=voice, default_lang=language, default_speed=speed)
+                    norm_text = " ".join(a.get('text', '') for a in acts if a.get('type') == 'speak').strip()
+                    direct_text = norm_text or text
+                except Exception:
+                    direct_text = text
+                try:
+                    app.logger.info(f"[synthesize-direct] normalize decimals: orig='{text}' -> norm='{direct_text}'")
+                except Exception:
+                    pass
+                samples, sample_rate = model.create(
+                    direct_text,
+                    voice=voice,
+                    lang=language,
+                    speed=speed
+                )
 
         # Save to temporary file
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')

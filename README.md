@@ -7,6 +7,7 @@ A CLI text-to-speech tool using the Kokoro model, supporting multiple languages,
 ## Features
 
 - Multiple language and voice support
+- SSML support (voice, rate, breaks; streaming and non-stream)
 - Voice blending with customizable weights
 - EPUB, PDF and TXT file input support
 - Standard input (stdin) and `|` piping from other programs
@@ -239,6 +240,25 @@ kokoro-tts --help-voices
 
 # List supported languages
 kokoro-tts --help-languages
+
+### SSML Support
+
+You can use SSML in the Web UI and backend endpoints. Paste SSML into the text box or POST JSON with `text` containing SSML. Supported tags include `<speak>`, `<voice name=...>`, `<prosody rate=...>`, and `<break time|strength>`. The streaming endpoint also honors these and emits silence frames for `<break>`.
+
+Example:
+
+```
+<speak xml:lang="en-us">
+  <voice name="af_nicole">Hello there.</voice>
+  <break time="500ms"/>
+  <prosody rate="fast">This should be quicker.</prosody>
+  <!-- volume/pitch parsed; volume applied, pitch currently ignored -->
+</speak>
+```
+
+Endpoints:
+- `/synthesize` (returns WAV): send `{ text, voice, language, speed, ... }` with SSML in `text`.
+- `/synthesize-stream` (octet-stream frames): same payload; frames use `KOPC` header + PCM.
 ```
 
 > [!TIP]
