@@ -351,9 +351,9 @@
                 };
 
                 if (streamingToggle.checked) {
-                    await streamPlay('/synthesize-stream', payload);
+                    await streamPlayWs(payload);
                 } else {
-                    const response = await fetch('/synthesize', {
+                    const response = await fetch('/flask/synthesize', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -383,7 +383,7 @@
             }
         });
 
-        async function streamPlay(endpoint, payload) {
+        async function streamPlayHttp(endpoint, payload) {
             // Initialize AudioContext lazily
             if (!audioCtx) {
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -464,6 +464,87 @@
                     }
                 }
             }
+        }
+
+        async function streamPlayWs(payload) {
+            // Initialize AudioContext lazily
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            playHead = audioCtx.currentTime + 0.05;
+
+            const t0 = performance.now();
+            let firstReported = false;
+
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            const wsUrl = `${proto}://${location.host}/ws/stream`;
+            const ws = new WebSocket(wsUrl);
+
+            // Prepare UI for playback via WebAudio
+            audioPlayer.classList.add('show');
+            audio.removeAttribute('src');
+
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                ws.send(JSON.stringify({
+                    text: document.getElementById('text').value,
+                    voice: document.getElementById('voice').value,
+                    language: document.getElementById('language').value,
+                    speed: parseFloat(speedInput.value),
+                    stream_chunk_chars: 100
+                }));
+            };
+
+            ws.onmessage = (event) => {
+                const value = new Uint8Array(event.data);
+                let buffer = value; // single message holds one frame
+
+                if (!buffer || buffer.length < 12) return;
+                const m0 = buffer[0], m1 = buffer[1], m2 = buffer[2], m3 = buffer[3];
+                if (m0 !== 0x4b || m1 !== 0x4f || m2 !== 0x50 || m3 !== 0x43) { // 'KOPC'
+                    return; // ignore unexpected packet
+                }
+                const sr = (buffer[4] << 24) | (buffer[5] << 16) | (buffer[6] << 8) | buffer[7];
+                const length = (buffer[8] << 24) | (buffer[9] << 16) | (buffer[10] << 8) | buffer[11];
+                if (buffer.length < 12 + length) return;
+                const payload = buffer.slice(12, 12 + length);
+
+                if (length > 0 && sr > 0) {
+                    if (!firstReported) {
+                        const dt = Math.round(performance.now() - t0);
+                        firstChunkMsEl.textContent = String(dt);
+                        metricsDiv.style.display = 'block';
+                        firstReported = true;
+                    }
+                    const f32 = new Float32Array(payload.buffer, payload.byteOffset, payload.byteLength / 4);
+                    const buf = audioCtx.createBuffer(1, f32.length, sr);
+                    buf.getChannelData(0).set(f32);
+                    const src = audioCtx.createBufferSource();
+                    src.buffer = buf;
+                    const gain = audioCtx.createGain();
+                    src.connect(gain);
+                    gain.connect(audioCtx.destination);
+
+                    const startTime = Math.max(audioCtx.currentTime + 0.02, playHead - overlapCrossfadeSec);
+                    const endTime = startTime + (f32.length / sr);
+                    gain.gain.setValueAtTime(0.0, startTime);
+                    gain.gain.linearRampToValueAtTime(1.0, startTime + overlapCrossfadeSec);
+                    gain.gain.setValueAtTime(1.0, endTime - overlapCrossfadeSec);
+                    gain.gain.linearRampToValueAtTime(0.0, endTime);
+                    src.start(startTime);
+                    playHead = endTime;
+                }
+            };
+
+            ws.onerror = (e) => {
+                errorDiv.textContent = 'WebSocket error';
+                errorDiv.classList.add('show');
+            };
+
+            ws.onclose = () => {
+                // Done streaming
+            };
         }
     </script>
 </body>

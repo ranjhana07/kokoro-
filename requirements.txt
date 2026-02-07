@@ -9,3 +9,6 @@ defusedxml
 flask
 requests
 defusedxml
+fastapi
+uvicorn
+websockets

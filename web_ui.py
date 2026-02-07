@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Production web UI for Kokoro TTS with chunking pipeline
+Production web UI for Kokoro TTS with chunking pipeline, now served via FastAPI
+with a WebSocket endpoint for low-latency streaming. The existing Flask UI is
+mounted under FastAPI to preserve templates and routes.
 """
 import os
 import sys
@@ -15,8 +17,15 @@ import soundfile as sf
 import numpy as np
 from kokoro_tts.ssml_parser import parse_ssml
 
-app = Flask(__name__)
-@app.route('/favicon.ico')
+# FastAPI + WebSocket server
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import RedirectResponse
+from fastapi.middleware.wsgi import WSGIMiddleware
+from starlette.staticfiles import StaticFiles
+
+# Flask app (mounted under FastAPI)
+flask_app = Flask(__name__)
+@flask_app.route('/favicon.ico')
 def favicon():
     # Serve SVG favicon or return 204 to avoid 404 noise
     svg_path = os.path.join(os.path.dirname(__file__), 'static', 'favicon.svg')
@@ -165,7 +174,7 @@ def crossfade_concat(samples_list, sample_rate, overlap_ms=CHUNK_OVERLAP_MS):
     np.clip(out, -1.0, 1.0, out=out)
     return out
 
-@app.route('/synthesize-stream', methods=['POST'])
+@flask_app.route('/synthesize-stream', methods=['POST'])
 def synthesize_stream():
     """Streaming synthesis: framed raw PCM for minimal decode overhead.
     Frame per chunk: magic 'KOPC' (4 bytes) + sample_rate (u32 BE) + length (u32 BE) + float32 PCM LE bytes.
@@ -348,11 +357,11 @@ LANGUAGES = [
     "cmn"       # Chinese (Mandarin)
 ]
 
-@app.route('/')
+@flask_app.route('/')
 def index():
     return render_template('index.html', voices=VOICES, languages=LANGUAGES)
 
-@app.route('/synthesize', methods=['POST'])
+@flask_app.route('/synthesize', methods=['POST'])
 def synthesize():
     try:
         data = request.json or {}
@@ -562,8 +571,190 @@ def synthesize():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# -----------------------------
+# FastAPI app with WebSocket API
+# -----------------------------
+
+# Create FastAPI app and mount Flask under /flask
+app = FastAPI()
+
+# Serve static files (for favicon and assets) directly at /static
+BASE_DIR = os.path.dirname(__file__)
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
+# Mount Flask UI under /flask
+app.mount("/flask", WSGIMiddleware(flask_app))
+
+@app.get("/")
+async def root_redirect():
+    # Redirect root to Flask UI
+    return RedirectResponse(url="/flask/")
+
+@app.websocket("/ws/stream")
+async def ws_stream(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        init_msg = await websocket.receive_text()
+        import json
+        data = json.loads(init_msg) if init_msg else {}
+
+        text = str(data.get('text', '')).strip()
+        voice = str(data.get('voice', 'af_nicole'))
+        language = str(data.get('language', 'en-us'))
+        raw_speed = data.get('speed', 1.0)
+        try:
+            speed = float(raw_speed)
+        except (TypeError, ValueError):
+            await websocket.close(code=1003, reason='Invalid speed; must be a number between 0.5 and 2.0')
+            return
+
+        if not text:
+            await websocket.close(code=1003, reason='No text provided')
+            return
+        if len(text) > MAX_TEXT_LENGTH:
+            await websocket.close(code=1009, reason=f'Text too long. Maximum {MAX_TEXT_LENGTH} characters.')
+            return
+
+        max_chars = int(data.get('stream_chunk_chars', 100))
+
+        # SSML detection
+        is_ssml = '<speak' in text.lower()
+
+        async def send_pcm_frame(samples: np.ndarray, sample_rate: int):
+            pcm = np.asarray(samples, dtype=np.float32).tobytes()
+            header = b'KOPC' + int(sample_rate).to_bytes(4, 'big') + len(pcm).to_bytes(4, 'big')
+            await websocket.send_bytes(header + pcm)
+
+        if not is_ssml:
+            # Normalize decimals via SSML parser
+            try:
+                acts = parse_ssml(text, default_voice=voice, default_lang=language, default_speed=speed)
+                norm_text = " ".join(a.get('text', '') for a in acts if a.get('type') == 'speak').strip()
+                text_to_stream = norm_text or text
+            except Exception:
+                text_to_stream = text
+
+            chunks = split_for_streaming(text_to_stream, max_chars=max_chars)
+
+            # Threaded prefetch similar to HTTP streaming path
+            with concurrent.futures.ThreadPoolExecutor(max_workers=CHUNK_MAX_WORKERS) as pool:
+                futures = []
+                for idx in range(min(CHUNK_PREFETCH, len(chunks))):
+                    futures.append(pool.submit(
+                        model.create,
+                        chunks[idx],
+                        voice=voice,
+                        lang=language,
+                        speed=speed
+                    ))
+                next_idx = len(futures)
+                processed = 0
+                while processed < len(chunks):
+                    fut = futures.pop(0)
+                    try:
+                        samples, sample_rate = fut.result()
+                    except Exception:
+                        samples, sample_rate = np.zeros((0,), dtype=np.float32), 0
+                    if next_idx < len(chunks):
+                        futures.append(pool.submit(
+                            model.create,
+                            chunks[next_idx],
+                            voice=voice,
+                            lang=language,
+                            speed=speed
+                        ))
+                        next_idx += 1
+                    processed += 1
+                    await send_pcm_frame(samples, sample_rate)
+            await websocket.close(code=1000)
+            return
+
+        # SSML path with <break> handling
+        actions = parse_ssml(text, default_voice=voice, default_lang=language, default_speed=speed)
+        sample_rate_probe = None
+
+        def ensure_sr(v, l, s):
+            nonlocal sample_rate_probe
+            if sample_rate_probe is None:
+                try:
+                    _, sr = model.create("Hello.", voice=v or voice, lang=l or language, speed=s or speed)
+                    sample_rate_probe = sr
+                except Exception:
+                    sample_rate_probe = 24000
+
+        for act in actions:
+            if act.get('type') == 'speak':
+                seg_text = act.get('text', '')
+                ctx_voice = act.get('voice') or voice
+                ctx_lang = act.get('lang') or language
+                try:
+                    ctx_speed = float(act.get('speed') or speed)
+                except Exception:
+                    ctx_speed = speed
+                ctx_volume = float(act.get('volume')) if act.get('volume') is not None else 1.0
+
+                seg_chunks = split_for_streaming(seg_text, max_chars=max_chars)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=CHUNK_MAX_WORKERS) as pool:
+                    futures = []
+                    for idx in range(min(CHUNK_PREFETCH, len(seg_chunks))):
+                        futures.append(pool.submit(
+                            model.create,
+                            seg_chunks[idx],
+                            voice=ctx_voice,
+                            lang=ctx_lang,
+                            speed=ctx_speed
+                        ))
+                    next_idx = len(futures)
+                    processed = 0
+                    while processed < len(seg_chunks):
+                        fut = futures.pop(0)
+                        try:
+                            samples_seg, sr = fut.result()
+                        except Exception:
+                            samples_seg, sr = np.zeros((0,), dtype=np.float32), sample_rate_probe or 0
+                        if sample_rate_probe is None:
+                            sample_rate_probe = sr
+                        if next_idx < len(seg_chunks):
+                            futures.append(pool.submit(
+                                model.create,
+                                seg_chunks[next_idx],
+                                voice=ctx_voice,
+                                lang=ctx_lang,
+                                speed=ctx_speed
+                            ))
+                            next_idx += 1
+                        seg = np.asarray(samples_seg, dtype=np.float32)
+                        if ctx_volume != 1.0:
+                            seg = np.clip(seg * ctx_volume, -1.0, 1.0)
+                        await send_pcm_frame(seg, int(sample_rate_probe or sr))
+                        processed += 1
+            elif act.get('type') == 'break':
+                ms = int(act.get('time_ms', 0))
+                if ms > 0:
+                    ensure_sr(act.get('voice'), act.get('lang'), act.get('speed'))
+                    silence_len = int((ms / 1000.0) * (sample_rate_probe or 24000))
+                    if silence_len > 0:
+                        seg = np.zeros((silence_len,), dtype=np.float32)
+                        await send_pcm_frame(seg, int(sample_rate_probe or 24000))
+
+        await websocket.close(code=1000)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await websocket.close(code=1011, reason=str(e))
+        except Exception:
+            pass
+
 if __name__ == '__main__':
-    print("Starting Kokoro TTS Web UI...")
-    print("Open your browser at http://localhost:5000")
-    # Run without debug/reloader to avoid Windows watchdog restarts and WinError 10038 on shutdown
-    app.run(debug=False, use_reloader=False, host='0.0.0.0', port=5000)
+    # Prefer running under uvicorn for WebSocket support
+    try:
+        import uvicorn
+        print("Starting Kokoro TTS FastAPI server...")
+        print("Open your browser at http://localhost:7860")
+        uvicorn.run(app, host='0.0.0.0', port=7860)
+    except ImportError:
+        # Fallback to Flask-only run (no WebSocket)
+        print("uvicorn not installed; starting Flask UI only (no WebSocket)")
+        print("Open your browser at http://localhost:5000")
+        flask_app.run(debug=False, use_reloader=False, host='0.0.0.0', port=5000)

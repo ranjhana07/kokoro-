@@ -4,6 +4,8 @@ import time
 import json
 import struct
 import requests
+import asyncio
+import websockets
 import numpy as np
 import sounddevice as sd
 
@@ -202,12 +204,12 @@ def stream_play_session(host: str, text: str, voice: str, language: str, speed: 
 def main():
     ap = argparse.ArgumentParser(description="Kokoro TTS streaming client")
     ap.add_argument("text", help="Text or SSML to synthesize")
-    ap.add_argument("--host", default="http://localhost:5000", help="Server host URL")
+    ap.add_argument("--host", default="http://localhost:7860", help="Server host URL (http for REST; ws for WebSocket)")
     ap.add_argument("--voice", default="af_nicole", help="Voice name")
     ap.add_argument("--language", default="en-us", help="Language code")
     ap.add_argument("--speed", type=float, default=1.0, help="Speech rate multiplier")
     ap.add_argument("--device", type=int, default=None, help="sounddevice output device index")
-    ap.add_argument("--protocol", choices=["session", "legacy"], default="session", help="Streaming protocol")
+    ap.add_argument("--protocol", choices=["ws", "session", "legacy"], default="ws", help="Streaming protocol")
     # Legacy tuning flags retained for compatibility
     ap.add_argument("--chunking", action="store_true", help="Enable server chunking (legacy)")
     ap.add_argument("--chunk-chars", type=int, default=140, help="Approx chars per stream chunk (legacy)")
@@ -233,7 +235,7 @@ def main():
                 chunk_prefetch=args.chunk_prefetch,
                 device=args.device,
             )
-        else:
+        elif args.protocol == "session":
             stream_play_session(
                 host=args.host,
                 text=args.text,
@@ -244,6 +246,60 @@ def main():
                 target_latency_ms=args.target_latency_ms,
                 device=args.device,
             )
+        else:
+            # WebSocket streaming via /ws/stream
+            async def run_ws():
+                uri = args.host.replace("http://", "ws://").replace("https://", "wss://")
+                if not uri.endswith("/ws/stream"):
+                    uri = uri.rstrip("/") + "/ws/stream"
+                async with websockets.connect(uri, max_size=None) as ws:
+                    init = {
+                        "text": args.text,
+                        "voice": args.voice,
+                        "language": args.language,
+                        "speed": float(args.speed),
+                        "stream_chunk_chars": 100,
+                    }
+                    await ws.send(json.dumps(init))
+                    byte_buffer = bytearray()
+                    sr_initial = None
+                    stream = None
+                    out_sr = None
+                    try:
+                        async for msg in ws:
+                            if isinstance(msg, bytes):
+                                byte_buffer.extend(msg)
+                                frames = parse_frames_legacy(byte_buffer)
+                                for frame_sr, pcm_le in frames:
+                                    if frame_sr <= 0:
+                                        continue
+                                    if sr_initial is None:
+                                        sr_initial = frame_sr
+                                        try:
+                                            out_sr = sr_initial
+                                            stream = sd.OutputStream(channels=1, samplerate=out_sr, dtype="float32", device=args.device)
+                                            stream.start()
+                                        except Exception:
+                                            out_sr = 48000
+                                            stream = sd.OutputStream(channels=1, samplerate=out_sr, dtype="float32", device=args.device)
+                                            stream.start()
+                                    f32 = np.frombuffer(pcm_le, dtype=np.float32)
+                                    if f32.size == 0:
+                                        continue
+                                    if out_sr and out_sr != sr_initial:
+                                        f32 = _resample_linear(f32, sr_initial, out_sr)
+                                    audio = f32.reshape(-1, 1)
+                                    if stream:
+                                        stream.write(audio)
+                    finally:
+                        try:
+                            if stream:
+                                time.sleep(0.05)
+                                stream.stop()
+                                stream.close()
+                        except Exception:
+                            pass
+            asyncio.run(run_ws())
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(0)
